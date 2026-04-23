@@ -142,8 +142,8 @@ export async function fetchLivePrediction(ticker, name, days, quantity) {
   const currentPrice = parseFloat(lastClose.toFixed(2))
 
   // ─── Prediction model ─────────────────────────────────────────────────────
-  // Use trailing 30-day price data to estimate daily drift & volatility
-  const recent = rawHistory.slice(-30)
+  // Use trailing 90-day price data to estimate daily drift & volatility (more stable)
+  const recent = rawHistory.slice(-90)
   const returns = []
   for (let i = 1; i < recent.length; i++) {
     returns.push((recent[i].price - recent[i - 1].price) / recent[i - 1].price)
@@ -152,10 +152,14 @@ export async function fetchLivePrediction(ticker, name, days, quantity) {
   const variance = returns.reduce((a, b) => a + (b - meanReturn) ** 2, 0) / returns.length
   const dailyVol = Math.sqrt(variance)
 
+  // Cap meanReturn to avoid exponential explosions for long durations
+  // 0.001 daily is roughly 28% annualized return.
+  const cappedReturn = Math.max(-0.001, Math.min(0.001, meanReturn))
+
   // Monte-Carlo-style prediction with confidence band
   const predicted = []
   let midPrice = currentPrice
-  const bandGrowthRate = dailyVol * 1.5  // widen with vol
+  const bandGrowthRate = dailyVol * 1.2  // widen with vol
 
   // Simple seeded noise using closing prices as deterministic seed
   let noiseState = Math.round(currentPrice * 1000) % 2147483647
@@ -166,12 +170,17 @@ export async function fetchLivePrediction(ticker, name, days, quantity) {
   }
 
   for (let i = 1; i <= days; i++) {
+    // Decay drift towards 0 over long periods to prevent infinite compounding
+    const driftDecay = Math.max(0.1, 1 - (i / 1500))
+    const currentDrift = cappedReturn * driftDecay
+
     const noise = (nextNoise() - 0.5) * 2 * dailyVol * midPrice
-    midPrice = Math.max(midPrice + meanReturn * midPrice + noise, 0.01)
+    // Calculate new price, with a floor to prevent going to literally zero or negative
+    midPrice = Math.max(midPrice + currentDrift * midPrice + noise, currentPrice * 0.05)
 
     const spreadFactor = bandGrowthRate * Math.sqrt(i)
     const upper = parseFloat((midPrice * (1 + spreadFactor)).toFixed(2))
-    const lower = parseFloat((midPrice * (1 - spreadFactor * 0.7)).toFixed(2))
+    const lower = parseFloat(Math.max(midPrice * (1 - spreadFactor * 0.7), currentPrice * 0.02).toFixed(2))
     const mid   = parseFloat(midPrice.toFixed(2))
 
     const futTs = Date.now() + i * 86400 * 1000
